@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+tile_geoparquet/__init__.py
+tile_geoparquet/assigner.py
+tile_geoparquet/cli.py
+tile_geoparquet/datasource.py
+tile_geoparquet/orchestrator.py
+tile_geoparquet/version.py
+tile_geoparquet/writer_pool.py
+tile_geoparquet.egg-info/PKG-INFO
+tile_geoparquet.egg-info/SOURCES.txt
+tile_geoparquet.egg-info/dependency_links.txt
+tile_geoparquet.egg-info/entry_points.txt
+tile_geoparquet.egg-info/requires.txt
+tile_geoparquet.egg-info/top_level.txt

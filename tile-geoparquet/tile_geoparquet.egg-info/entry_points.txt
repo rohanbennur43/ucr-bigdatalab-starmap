@@ -1,0 +1,2 @@
+[console_scripts]
+tile-geoparquet = tile_geoparquet.cli:main

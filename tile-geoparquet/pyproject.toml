@@ -1,0 +1,19 @@
+[project]
+name = "tile-geoparquet"
+version = "0.1.0"
+description = "Round-based tiler: GeoParquet → per-tile GeoParquet with bounded writers"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "pyarrow>=15",
+  "pandas>=2",
+  "numpy>=1.24",
+  "shapely>=2.0"
+]
+
+[project.scripts]
+tile-geoparquet = "tile_geoparquet.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

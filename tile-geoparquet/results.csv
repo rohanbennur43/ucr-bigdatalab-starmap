@@ -1,0 +1,5 @@
+max_parallel_files,exit_code,wall_time_sec,peak_rss_bytes,peak_rss_human,outdir
+30,0,78.742,14091517952,13.1 GB,out_tiles_run_mpf_30
+35,0,74.132,12052332544,11.2 GB,out_tiles_run_mpf_35
+40,0,69.05,14266417152,13.3 GB,out_tiles_run_mpf_40
+45,0,62.366,12922159104,12.0 GB,out_tiles_run_mpf_45
