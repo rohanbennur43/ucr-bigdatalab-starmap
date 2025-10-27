@@ -119,7 +119,7 @@ import logging
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-
+from shapely.geometry.base import BaseGeometry
 from shapely import box, from_wkb, from_wkt
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,10 @@ def _detect_geom_in_schema(schema: pa.Schema, default: str = "geometry"):
     col = j.get("primary_column") or default
     enc = j.get("columns", {}).get(col, {}).get("encoding", "WKB")
     return col, enc.upper()
+
+
+
+
 
 class TileAssignerFromCSV:
     """
@@ -179,6 +183,8 @@ class TileAssignerFromCSV:
         self._polys = polys
         self._tile_ids = tids
         self._tile_bounds = {tid: p.bounds for tid, p in zip(self._tile_ids, self._polys)}
+        # Fast lookup for per-tile bbox injection
+        self._tile_bounds = {tid: p.bounds for tid, p in zip(self._tile_ids, self._polys)}
 
         logger.info("Loaded index CSV '%s' with %d tiles (%d invalid rows skipped)",
                     index_csv_path, len(self._polys), bad)
@@ -191,6 +197,13 @@ class TileAssignerFromCSV:
             self._geom_encoding = enc
             logger.info("Geometry column detected: '%s' (encoding=%s)", self.geom_col, self._geom_encoding)
 
+    # def tile_bbox(self, tile_id: str):
+    #     """Return (xmin, ymin, xmax, ymax) for a tile_id from the index CSV (for metadata injection)."""
+    #     b = self._tile_bounds.get(str(tile_id))
+    #     if b is None:
+    #         raise KeyError(f"Unknown tile_id: {tile_id}")
+    #     return b
+    
     def tile_bbox(self, tile_id: str):
         return self._tile_bounds[str(tile_id)]  # (xmin, ymin, xmax, ymax)
 

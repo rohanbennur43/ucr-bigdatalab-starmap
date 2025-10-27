@@ -9,7 +9,7 @@ import pyarrow as pa
 from shapely import from_wkb, from_wkt
 import folium
 
-TILES_DIR = "tiles_out"
+TILES_DIR = "./tiles-out"
 OUT_HTML = "tiles_bboxes.html"
 
 def detect_geom(schema: pa.Schema, default="geometry"):

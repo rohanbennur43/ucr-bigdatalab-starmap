@@ -7,6 +7,7 @@ from .orchestrator import RoundOrchestrator
 __all__ = [
     "__version__",
     "DataSource", "GeoParquetSource",
+    "GeoJSONSource",
     "TileAssignerFromCSV",
     "WriterPool",
     "RoundOrchestrator",
