@@ -1,200 +1,265 @@
-from pathlib import Path
-from typing import Dict, List, Optional
-import logging
-import json
+from __future__ import annotations
 
+import json
+import math
+import os
+import multiprocessing
+import logging
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from shapely import from_wkb
+
+from .utils_large import ensure_large_types
 
 logger = logging.getLogger(__name__)
 
+# ------------------------- Sorting configuration -------------------------
+
+@dataclass
+class SortKey:
+    column: str
+    ascending: bool = True
+
+class SortMode:
+    NONE = "none"
+    COLUMNS = "columns"
+    ZORDER = "zorder"
+    HILBERT = "hilbert"
+
+# ------------------------- Utility: Morton (Z-order) ----------------------
+
+def _scale_to_uint(v: np.ndarray, vmin: float, vmax: float, bits: int) -> np.ndarray:
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        return np.zeros_like(v, dtype=np.uint64)
+    rng = vmax - vmin
+    x = (v - vmin) / rng
+    x = np.clip(x, 0.0, 1.0)
+    return (x * ((1 << bits) - 1)).astype(np.uint64, copy=False)
+
+def _interleave_bits_2d(x: np.ndarray, y: np.ndarray, bits: int) -> np.ndarray:
+    x = x.astype(np.uint64, copy=False)
+    y = y.astype(np.uint64, copy=False)
+
+    def part1by1(n):
+        n &= 0x00000000FFFFFFFF
+        n = (n | (n << 16)) & 0x0000FFFF0000FFFF
+        n = (n | (n << 8))  & 0x00FF00FF00FF00FF
+        n = (n | (n << 4))  & 0x0F0F0F0F0F0F0F0F
+        n = (n | (n << 2))  & 0x3333333333333333
+        n = (n | (n << 1))  & 0x5555555555555555
+        return n
+
+    return (part1by1(y) << 1) | part1by1(x)
+
+# ------------------------- Writer Pool (flush-once, MPF rounds) -------------------------
 
 class WriterPool:
+    """
+    Buffer-everything writer:
+      - append(tile_id, table): buffer Arrow Tables per tile (no IO)
+      - flush_all(): writes once, in rounds of up to `max_parallel_files` concurrent files
+    """
+
     def __init__(
         self,
         outdir: str,
-        src_schema: pa.Schema,
-        max_parallel_files: int,
-        row_group_rows: int,
         compression: str = "zstd",
-        bbox_resolver=None,  # callable: tile_id -> (xmin, ymin, xmax, ymax)
+        geom_col: str = "geometry",
+        max_parallel_files: Optional[int] = None,
+        sort_mode: str = SortMode.ZORDER,
+        sort_keys: Optional[Sequence[Union[SortKey, Tuple[str, bool], str]]] = None,
+        sfc_bits: int = 16,
+        parquet_writer_args: Optional[dict] = None,
+        global_extent: Optional[Tuple[float, float, float, float]] = None,
     ):
-        if max_parallel_files < 2:
-            raise ValueError("max_parallel_files must be >= 2 (tiles + 1 overflow).")
-        self.outdir = Path(outdir)
-        self.outdir.mkdir(parents=True, exist_ok=True)
-
-        # Keep an immutable reference to the incoming schema
-        self.src_schema = src_schema
-
-        # Capacity: K tile writers + 1 overflow
-        self.K = max_parallel_files - 1
-        self.row_group_rows = int(row_group_rows)
+        self.outdir = outdir
         self.compression = compression
+        self.geom_col = geom_col
+        self.sort_mode = sort_mode
+        self._sort_keys = self._normalize_sort_keys(sort_keys)
+        self.sfc_bits = int(sfc_bits)
+        self._pq_args = dict(parquet_writer_args or {})
+        self.global_extent = global_extent
 
-        self._writers: Dict[str, pq.ParquetWriter] = {}
-        self._open_tiles: List[str] = []
-        self._buffers: Dict[str, List[pa.Table]] = {}
+        if max_parallel_files is None:
+            cpu = max(1, multiprocessing.cpu_count())
+            self.max_parallel_files = max(2, cpu // 2)
+        else:
+            self.max_parallel_files = max(1, int(max_parallel_files))
 
-        self._overflow_writer: Optional[pq.ParquetWriter] = None
-        self._overflow_path: Optional[Path] = None
+        self._buffers: Dict[str, List[pa.Table]] = defaultdict(list)
 
-        self._bbox_resolver = bbox_resolver
+    # --------------------------- Public API ---------------------------
 
-        logger.info(
-            "WriterPool created: outdir=%s, K=%d, row_group_rows=%d, compression=%s",
-            self.outdir, self.K, self.row_group_rows, self.compression
-        )
+    def append(self, tile_id: str, table: pa.Table) -> None:
+        if table is None or table.num_rows == 0:
+            return
+        if self.geom_col not in table.column_names:
+            raise ValueError(f"WriterPool.append: missing geometry column '{self.geom_col}'")
+        table = table.combine_chunks()
+        table = ensure_large_types(table, self.geom_col)
+        self._buffers[tile_id].append(table)
 
-    def begin_round(self, round_id: int):
-        """Create/replace the overflow writer for this round."""
-        self._overflow_path = self.outdir / f"_overflow_round_{round_id}.parquet"
-        if self._overflow_path.exists():
-            self._overflow_path.unlink()
-        # Overflow uses the unmodified source schema
-        self._overflow_writer = pq.ParquetWriter(
-            str(self._overflow_path),
-            self.src_schema,
-            compression=self.compression,
-        )
-        logger.info("Begin round %d: overflow path=%s", round_id, self._overflow_path)
-
-    def _ensure_writer(self, tile_id: str):
-        """Ensure a writer exists for tile_id; may evict an older writer to honor K."""
-        if tile_id in self._writers:
+    def flush_all(self) -> None:
+        if not self._buffers:
+            logger.info("WriterPool.flush_all(): no buffered tiles to flush.")
             return
 
-        # Evict oldest open tile if at capacity
-        if len(self._open_tiles) >= self.K:
-            victim = self._open_tiles.pop(0)
-            self._flush_all(victim)
-            self._writers[victim].close()
-            del self._writers[victim]
-            logger.info("Closed writer for victim tile %s to make room", victim)
-
-        path = self.outdir / f"{tile_id}.parquet"
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Inject per-tile bbox into a cloned schema (if possible)
-        schema_with_bbox = self._schema_with_tile_bbox(tile_id)
-
-        self._writers[tile_id] = pq.ParquetWriter(
-            str(path),
-            schema_with_bbox,
-            compression=self.compression,
-        )
-        self._open_tiles.append(tile_id)
-        logger.info("Opened writer for tile %s", tile_id)
-        logger.debug("Tile %s schema metadata: %s", tile_id, schema_with_bbox.metadata)
-
-    def _schema_with_tile_bbox(self, tile_id: str) -> pa.Schema:
-        """
-        Return a copy of the source schema with GeoParquet 'geo' JSON updated to
-        set columns[primary].bbox = (xmin, ymin, xmax, ymax) for this tile.
-        Falls back to the unmodified schema if metadata/resolver is absent or errors occur.
-        """
-        try:
-            md = dict(self.src_schema.metadata or {})
-            geo_raw = md.get(b"geo")
-            if not geo_raw or self._bbox_resolver is None:
-                # Return a shallow copy so the ParquetWriter can't mutate the original
-                return pa.schema(self.src_schema)
-
-            geo = json.loads(geo_raw.decode("utf-8"))
-            primary = geo.get("primary_column") or "geometry"
-            cols = geo.setdefault("columns", {})
-            col_md = cols.setdefault(primary, {})
-
-            xmin, ymin, xmax, ymax = self._bbox_resolver(tile_id)
-            col_md["bbox"] = [float(xmin), float(ymin), float(xmax), float(ymax)]
-
-            md[b"geo"] = json.dumps(geo, separators=(",", ":")).encode("utf-8")
-            return pa.schema(self.src_schema, metadata=md)
-        except Exception as e:
-            logger.warning("Failed to inject bbox metadata for tile %s: %s", tile_id, e)
-            return pa.schema(self.src_schema)
-
-    def append_tile_rows(self, tile_id: str, tbl: pa.Table):
-        if tbl.num_rows == 0:
-            return
-        buf = self._buffers.setdefault(tile_id, [])
-        buf.append(tbl)
-        self._flush_row_groups(tile_id)
-        logger.debug(
-            "Appended %d rows to buffer for tile %s (buffered batches=%d)",
-            tbl.num_rows, tile_id, len(self._buffers[tile_id])
-        )
-
-    def divert_to_overflow(self, tbl: pa.Table):
-        """Write a sub-table to the round overflow file."""
-        if tbl.num_rows == 0:
-            return
-        assert self._overflow_writer is not None
-        # Respect configured row group size for overflow as well
-        self._overflow_writer.write_table(tbl, row_group_size=self.row_group_rows)
-        logger.info("Diverted %d rows to overflow", tbl.num_rows)
-
-    def _flush_row_groups(self, tile_id: str):
-        """Flush full row groups for the given tile from its buffered batches."""
-        if tile_id not in self._buffers:
-            return
-        total = sum(t.num_rows for t in self._buffers[tile_id])
-        logger.debug("Flushing row groups for tile %s: total buffered rows=%d", tile_id, total)
-
-        while total >= self.row_group_rows:
-            need = self.row_group_rows
-            chunks: List[pa.Table] = []
-            while need > 0:
-                t = self._buffers[tile_id][0]
-                if t.num_rows <= need:
-                    chunks.append(t)
-                    self._buffers[tile_id].pop(0)
-                    need -= t.num_rows
-                else:
-                    chunks.append(t.slice(0, need))
-                    self._buffers[tile_id][0] = t.slice(need)
-                    need = 0
-
-            out = pa.concat_tables(chunks) if len(chunks) > 1 else chunks[0]
-            self._ensure_writer(tile_id)
-            self._writers[tile_id].write_table(out, row_group_size=self.row_group_rows)
-            total -= self.row_group_rows
-            logger.info("Flushed row_group of %d rows for tile %s", self.row_group_rows, tile_id)
-
-    def _flush_all(self, tile_id: str):
-        """Flush all remaining buffered rows for a tile as a final (possibly short) row group."""
-        buf = self._buffers.get(tile_id, [])
-        if not buf:
-            return
-        out = pa.concat_tables(buf) if len(buf) > 1 else buf[0]
-        self._buffers[tile_id].clear()
-        self._ensure_writer(tile_id)
-        self._writers[tile_id].write_table(out, row_group_size=self.row_group_rows)
-        logger.info("Flushed ALL buffered rows for tile %s (%d rows)", tile_id, out.num_rows)
-
-    def end_round(self) -> Path:
-        """
-        Flush and close all writers, clear buffers, and close the overflow writer.
-        Returns the overflow file path (it may be empty; caller can check and remove).
-        """
-        # 1) Flush ALL buffered tiles (even those without an open writer yet)
-        for tile_id in list(self._buffers.keys()):
-            self._flush_all(tile_id)
-
-        # 2) Close & drop any writers we opened
-        for tile_id in list(self._writers.keys()):
-            self._writers[tile_id].close()
-            del self._writers[tile_id]
-        self._open_tiles.clear()
-
-        # 3) Clear buffers explicitly
+        os.makedirs(self.outdir, exist_ok=True)
+        items = list(self._buffers.items())
         self._buffers.clear()
 
-        # 4) Close overflow
-        assert self._overflow_writer is not None
-        self._overflow_writer.close()
-        path = self._overflow_path  # may be None in theory, but begin_round() must be called
-        self._overflow_writer = None
-        self._overflow_path = None
+        total = len(items)
+        mpf = min(self.max_parallel_files, total)
+        rounds = math.ceil(total / mpf)
+        logger.info(f"WriterPool.flush_all(): {total} tiles buffered → flushing in {rounds} round(s), "
+                    f"{mpf} parallel writes per round.")
 
-        return path  # type: ignore
+        def _finalize_one_tile(tile_id: str, batches: List[pa.Table]) -> str:
+            logger.debug(f"[{tile_id}] Concatenating {len(batches)} batches.")
+            full = pa.concat_tables(batches, promote=True)
+            full = ensure_large_types(full, self.geom_col)
+            bbox, full = self._maybe_sort_and_bbox(full)
+            full = self._with_updated_geo_metadata(full, bbox)
+
+            out_path = os.path.join(self.outdir, f"{tile_id}.parquet")
+            logger.info(f"[{tile_id}] Writing to disk → {out_path}")
+            pq.write_table(full, out_path, compression=self.compression, **self._pq_args)
+            logger.debug(f"[{tile_id}] Flush complete, rows={full.num_rows}")
+            return out_path
+
+        for r in range(rounds):
+            start = r * mpf
+            batch = items[start : start + mpf]
+            logger.info(f"WriterPool: round {r+1}/{rounds} — writing {len(batch)} tiles to disk.")
+            if len(batch) == 1:
+                tid, b = batch[0]
+                _finalize_one_tile(tid, b)
+                continue
+            with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                futs = {ex.submit(_finalize_one_tile, tid, b): tid for tid, b in batch}
+                for f in as_completed(futs):
+                    try:
+                        _ = f.result()
+                    except Exception as e:
+                        logger.error(f"Error writing tile {futs[f]}: {e}")
+
+        logger.info("WriterPool.flush_all(): all tiles successfully flushed to disk.")
+
+    def close(self) -> None:
+        self.flush_all()
+
+    def set_sort_keys(self, sort_keys: Optional[Sequence[Union[SortKey, Tuple[str, bool], str]]]) -> None:
+        self._sort_keys = self._normalize_sort_keys(sort_keys)
+
+    # ------------------------- Internal helpers -----------------------
+
+    @staticmethod
+    def _normalize_sort_keys(
+        sort_keys: Optional[Sequence[Union[SortKey, Tuple[str, bool], str]]]
+    ) -> List[SortKey]:
+        out: List[SortKey] = []
+        if not sort_keys:
+            return out
+        for k in sort_keys:
+            if isinstance(k, SortKey):
+                out.append(k)
+            elif isinstance(k, tuple):
+                name, asc = k
+                out.append(SortKey(str(name), bool(asc)))
+            elif isinstance(k, str):
+                out.append(SortKey(k, True))
+            else:
+                raise TypeError(f"Unsupported sort key type: {type(k)}")
+        return out
+
+    def _maybe_sort_and_bbox(self, tbl: pa.Table) -> Tuple[Tuple[float, float, float, float], pa.Table]:
+        geoms = from_wkb(tbl[self.geom_col].to_numpy(zero_copy_only=False))
+
+        minx = np.inf; miny = np.inf; maxx = -np.inf; maxy = -np.inf
+        has_geom = False
+        centers_x = []; centers_y = []
+
+        for g in geoms:
+            if g is None or g.is_empty:
+                continue
+            bxmin, bymin, bxmax, bymax = g.bounds
+            minx, miny = min(minx, bxmin), min(miny, bymin)
+            maxx, maxy = max(maxx, bxmax), max(maxy, bymax)
+            c = g.centroid
+            centers_x.append(float(c.x))
+            centers_y.append(float(c.y))
+            has_geom = True
+
+        if not has_geom:
+            bbox = (np.inf, np.inf, -np.inf, -np.inf)
+            return bbox, tbl
+
+        bbox = (float(minx), float(miny), float(maxx), float(maxy))
+
+        if self.sort_mode == SortMode.NONE:
+            return bbox, tbl
+
+        if self.sort_mode == SortMode.COLUMNS:
+            if not self._sort_keys:
+                return bbox, tbl
+            spec = [{"column": sk.column, "order": "ascending" if sk.ascending else "descending"}
+                    for sk in self._sort_keys]
+            logger.debug("Sorting by columns: %s", spec)
+            return bbox, tbl.sort_by(spec)
+
+        if self.sort_mode in (SortMode.ZORDER, SortMode.HILBERT):
+            cx = np.asarray(centers_x, dtype=np.float64)
+            cy = np.asarray(centers_y, dtype=np.float64)
+            gxmin, gymin, gxmax, gymax = self.global_extent or bbox
+
+            X = _scale_to_uint(cx, gxmin, gxmax, self.sfc_bits)
+            Y = _scale_to_uint(cy, gymin, gymax, self.sfc_bits)
+            z = _interleave_bits_2d(X, Y, self.sfc_bits)
+
+            N = tbl.num_rows
+            max_code = np.uint64((1 << (2 * min(self.sfc_bits, 31))) - 1)
+            zfull = np.full(N, max_code, dtype=np.uint64)
+            valid_idx = [i for i, g in enumerate(geoms) if g and not g.is_empty]
+            if valid_idx:
+                zfull[np.asarray(valid_idx, dtype=np.int64)] = z
+            order = np.argsort(zfull, kind="mergesort")
+            logger.debug(f"Sorting {N} rows by Z-order (sfc_bits={self.sfc_bits})")
+            return bbox, tbl.take(pa.array(order, type=pa.int64()))
+
+        return bbox, tbl
+
+    def _with_updated_geo_metadata(
+        self,
+        tbl: pa.Table,
+        bbox: Tuple[float, float, float, float],
+    ) -> pa.Table:
+        schema = tbl.schema
+        meta = dict(schema.metadata or {})
+
+        geo_raw = meta.get(b"geo")
+        geo = {}
+        if geo_raw is not None:
+            try:
+                geo = json.loads(geo_raw.decode("utf-8"))
+            except Exception:
+                pass
+
+        geo.setdefault("version", "1.0.0")
+        geo.setdefault("primary_column", self.geom_col)
+        geo.setdefault("columns", {})
+        col = geo["columns"].get(self.geom_col, {})
+        col.setdefault("encoding", "WKB")
+        col["bbox"] = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+        geo["columns"][self.geom_col] = col
+        geo["bbox"] = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+
+        meta[b"geo"] = json.dumps(geo).encode("utf-8")
+        new_schema = schema.with_metadata(meta)
+        return tbl.replace_schema_metadata(new_schema.metadata)

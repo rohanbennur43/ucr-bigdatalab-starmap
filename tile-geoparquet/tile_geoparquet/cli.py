@@ -1,64 +1,119 @@
-import argparse, os, shutil, logging
-from .datasource import GeoParquetSource,GeoJSONSource, is_geojson_path
-from .assigner import TileAssignerFromCSV
-from .orchestrator import RoundOrchestrator
+from __future__ import annotations
+import argparse
+import logging
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+from .datasource import GeoParquetSource, GeoJSONSource, is_geojson_path
+from .assigner import TileAssignerFromCSV, RSGroveAssigner
+from .orchestrator import RoundOrchestrator
+from .writer_pool import SortMode, SortKey
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-def main():
-    ap = argparse.ArgumentParser(description="GeoJSON/GeoParquet → tiled GeoParquet (round-based, bounded writers).")
-    ap.add_argument("--index", required=True)
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--outdir", required=True)
-    ap.add_argument("--max-parallel-files", type=int, default=64)
-    ap.add_argument("--row-group-rows", type=int, default=100_000)
-    ap.add_argument("--geom-col", default="geometry")
-    ap.add_argument("--use-intersects", action="store_true")
-    ap.add_argument("--fresh-outdir", action="store_true")
 
-    ap.add_argument("--geojson-batch-rows", type=int, default=50_000,
-                    help="Rows per read batch when input is GeoJSON (default: 50k)")
-    ap.add_argument("--src-crs", default="EPSG:4326",
-                    help="Assumed source CRS for GeoJSON (default: EPSG:4326)")
-    ap.add_argument("--target-crs", default=None,
-                    help="Optional target CRS to reproject to during read (e.g., EPSG:3857)")
-    ap.add_argument("--keep-null-geoms", action="store_true",
-                    help="Keep rows with null/empty geometries (default: drop)")
+def build_source(input_path: str, geom_col: str):
+    if is_geojson_path(input_path):
+        logger.info("Using GeoJSONSource for %s", input_path)
+        return GeoJSONSource(input_path, geom_col=geom_col)
+    else:
+        logger.info("Using GeoParquetSource for %s", input_path)
+        return GeoParquetSource(input_path)
+
+
+def _parse_sort_mode(s: str) -> str:
+    s = (s or "").strip().lower()
+    if s in ("", "none"): return SortMode.NONE
+    if s in ("columns", "cols", "column"): return SortMode.COLUMNS
+    if s in ("z", "zorder", "z-order", "morton"): return SortMode.ZORDER
+    if s in ("hilbert", "h"): return SortMode.HILBERT
+    raise argparse.ArgumentTypeError(f"Unsupported --sort-mode: {s}")
+
+
+def _parse_sort_keys(keys: str | None):
+    # format examples:
+    #   "colA,colB" (both ascending)
+    #   "colA:asc,colB:desc"
+    if not keys:
+        return None
+    out = []
+    for tok in keys.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ":" in tok:
+            name, order = tok.split(":", 1)
+            out.append(SortKey(name.strip(), ascending=(order.strip().lower() != "desc")))
+        else:
+            out.append(SortKey(tok, True))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="GeoJSON/GeoParquet → tiled GeoParquet (round-based, bounded writers, single final writes)."
+    )
+    # Source
+    ap.add_argument("--input", required=True, help="Path to input GeoJSON or GeoParquet.")
+    ap.add_argument("--geom-col", default="geometry", help="Geometry column name (default: geometry).")
+
+    # Output / run
+    ap.add_argument("--outdir", required=True, help="Output directory for tiles.")
+    ap.add_argument("--compression", default="zstd", help="Parquet compression codec (default: zstd).")
+    ap.add_argument("--max-parallel-files", type=int, default=64,
+                    help="Max files to write concurrently each round.")
+    ap.add_argument("--sort-mode", type=_parse_sort_mode, default=SortMode.ZORDER,
+                    help="none|columns|zorder|hilbert (hilbert currently = zorder).")
+    ap.add_argument("--sort-keys", default=None,
+                    help='Only for --sort-mode=columns. Example: "colA:asc,colB:desc".')
+    ap.add_argument("--sfc-bits", type=int, default=16,
+                    help="Bits per axis for Z-order/Hilbert key (typical: 16–20).")
+
+    # Mode
+    ap.add_argument("--index", help="CSV index with columns: id,minx,miny,maxx,maxy (legacy mode).")
+    ap.add_argument("--num-tiles", type=int, help="Number of tiles to build via RSGrove (preferred).")
+    ap.add_argument("--seed", type=int, default=42, help="Seed for RSGrove (if --num-tiles is used).")
+
+    # Sampling (RSGrove)
+    ap.add_argument("--sample-ratio", type=float, default=1.0,
+                    help="Bernoulli sampling probability for centroids (0<r<=1).")
+    ap.add_argument("--sample-cap", type=int, default=None,
+                    help="Reservoir sampling cap K (wins over ratio if provided).")
 
     args = ap.parse_args()
 
-    if args.fresh_outdir and os.path.isdir(args.outdir):
-        shutil.rmtree(args.outdir)
+    source = build_source(args.input, geom_col=args.geom_col)
 
-    logger.info(f"CLI invoked with input={args.input}, index={args.index}, outdir={args.outdir}")
-    # Select data source: GeoJSON vs GeoParquet
-    if is_geojson_path(args.input):
-        try:
-            source = GeoJSONSource(
-                path=args.input,
-                batch_rows=args.geojson_batch_rows,
-                src_crs=args.src_crs,
-                target_crs=args.target_crs,
-                keep_null_geoms=args.keep_null_geoms,
-            )
-            logger.info("Using GeoJSONSource with pyogrio")
-        except ImportError as e:
-            raise SystemExit(
-                "pyogrio is required to read GeoJSON as Arrow. "
-                "Install with: pip install pyogrio"
-            ) from e
+    if args.index:
+        logger.info("Using TileAssignerFromCSV with index=%s", args.index)
+        assigner = TileAssignerFromCSV(args.index, geom_col=args.geom_col)
     else:
-        source = GeoParquetSource(args.input)
+        if not args.num_tiles:
+            ap.error("You must supply either --index (CSV) or --num-tiles (RSGrove).")
+        logger.info(
+            "Building RSGroveAssigner from source with num_tiles=%d seed=%d ratio=%.4f cap=%s",
+            args.num_tiles, args.seed, args.sample_ratio, str(args.sample_cap),
+        )
+        assigner = RSGroveAssigner.from_source(
+            tables=source.iter_tables(),  # streaming
+            num_partitions=args.num_tiles,
+            geom_col=args.geom_col,
+            seed=args.seed,
+            sample_ratio=args.sample_ratio,
+            sample_cap=args.sample_cap,
+        )
 
-
-    assigner = TileAssignerFromCSV(args.index, geom_col=args.geom_col, use_intersects=args.use_intersects)
     orchestrator = RoundOrchestrator(
         source=source,
         assigner=assigner,
         outdir=args.outdir,
         max_parallel_files=args.max_parallel_files,
-        row_group_rows=args.row_group_rows,
-        compression="zstd",
+        compression=args.compression,
+        sort_mode=args.sort_mode,
+        sort_keys=_parse_sort_keys(args.sort_keys),
+        sfc_bits=args.sfc_bits,
     )
     orchestrator.run()
+
+
+if __name__ == "__main__":
+    main()
