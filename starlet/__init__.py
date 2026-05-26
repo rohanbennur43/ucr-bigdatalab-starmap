@@ -170,6 +170,8 @@ def generate_mvt(
     outdir: str | None = None,
     auto_zoom: bool = True,
     occupancy_threshold: float = 0.01,
+    mbtiles: bool = False,
+    mbtiles_path: str | None = None,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
 
@@ -190,10 +192,17 @@ def generate_mvt(
     occupancy_threshold : float
         Minimum tile occupancy (nonempty_tiles / total_tiles) for auto-zoom detection.
         Default 0.01 (1% occupancy).
+    mbtiles : bool
+        If True, export MVT tiles to MBTiles archive after generation.
+        Default False.
+    mbtiles_path : str | None
+        Output path for MBTiles file. Defaults to ``<tile_dir>/<dataset>.mbtiles``.
+        Only used if ``mbtiles=True``.
 
     Returns
     -------
     MVTResult
+        Result object with mbtiles_path set if mbtiles=True.
     """
     from pathlib import Path
     from starlet._internal.mvt.generator import BucketMVTGenerator
@@ -221,10 +230,24 @@ def generate_mvt(
         if d.is_dir() and d.name.isdigit()
     ) if mvt_path.exists() else []
 
+    # Export to MBTiles if requested
+    mbtiles_file = None
+    if mbtiles:
+        from starlet._internal.mbtiles.exporter import export_to_mbtiles
+
+        dataset_name = Path(tile_dir).name
+        default_path = str(Path(tile_dir) / f"{dataset_name}.mbtiles")
+        mbtiles_file = export_to_mbtiles(
+            mvt_dir=mvt_outdir,
+            output_path=mbtiles_path or default_path,
+            dataset_dir=tile_dir,
+        )
+
     return MVTResult(
         outdir=mvt_outdir,
         zoom_levels=zoom_levels,
         tile_count=tile_count,
+        mbtiles_path=mbtiles_file,
     )
 
 
@@ -235,6 +258,8 @@ def build(
     zoom: int = 7,
     num_tiles: int = 40,
     threshold: float = 100_000,
+    mbtiles: bool = False,
+    mbtiles_path: str | None = None,
     **tile_kwargs,
 ) -> tuple[TileResult, MVTResult]:
     """Run the full pipeline: tile then generate MVTs.
@@ -251,15 +276,28 @@ def build(
         Target number of spatial partitions.
     threshold : float
         Minimum feature count per MVT tile.
+    mbtiles : bool
+        If True, export MVT tiles to MBTiles archive after generation.
+        Default False.
+    mbtiles_path : str | None
+        Output path for MBTiles file. Defaults to ``<outdir>/<dataset>.mbtiles``.
+        Only used if ``mbtiles=True``.
     **tile_kwargs
         Additional keyword arguments forwarded to :func:`tile`.
 
     Returns
     -------
     tuple[TileResult, MVTResult]
+        Result objects with MVTResult.mbtiles_path set if mbtiles=True.
     """
     tile_result = tile(input=input, outdir=outdir, num_tiles=num_tiles, **tile_kwargs)
-    mvt_result = generate_mvt(tile_dir=outdir, zoom=zoom, threshold=threshold)
+    mvt_result = generate_mvt(
+        tile_dir=outdir,
+        zoom=zoom,
+        threshold=threshold,
+        mbtiles=mbtiles,
+        mbtiles_path=mbtiles_path,
+    )
     return tile_result, mvt_result
 
 

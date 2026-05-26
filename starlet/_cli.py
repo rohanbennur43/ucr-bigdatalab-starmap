@@ -86,8 +86,10 @@ def tile(input_path, outdir, num_tiles, partition_size, sort, compression,
 @click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
 @click.option("--threshold", type=float, default=0, show_default=True, help="Minimum feature count per tile.")
 @click.option("--outdir", default=None, help="MVT output directory (default: <dir>/mvt/).")
+@click.option("--mbtiles", is_flag=True, help="Export MVT tiles to MBTiles archive.")
+@click.option("--mbtiles-path", default=None, help="MBTiles output path (default: <dir>/<dataset>.mbtiles).")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def mvt(tile_dir, zoom, threshold, outdir, log_level):
+def mvt(tile_dir, zoom, threshold, outdir, mbtiles, mbtiles_path, log_level):
     """Generate Mapbox Vector Tiles from a tiled dataset."""
     _setup_logging(log_level)
     import starlet
@@ -97,10 +99,14 @@ def mvt(tile_dir, zoom, threshold, outdir, log_level):
         zoom=zoom,
         threshold=threshold,
         outdir=outdir,
+        mbtiles=mbtiles,
+        mbtiles_path=mbtiles_path,
     )
     click.echo(f"MVT generation complete: {result.tile_count} tiles")
     click.echo(f"  Output: {result.outdir}")
     click.echo(f"  Zoom levels: {result.zoom_levels}")
+    if result.mbtiles_path:
+        click.echo(f"  MBTiles: {result.mbtiles_path}")
 
 
 @main.command()
@@ -109,8 +115,10 @@ def mvt(tile_dir, zoom, threshold, outdir, log_level):
 @click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
 @click.option("--num-tiles", type=int, default=40, show_default=True, help="Target number of spatial partitions.")
 @click.option("--threshold", type=float, default=100000, show_default=True, help="Minimum feature count per MVT tile.")
+@click.option("--mbtiles", is_flag=True, help="Export MVT tiles to MBTiles archive.")
+@click.option("--mbtiles-path", default=None, help="MBTiles output path (default: <outdir>/<dataset>.mbtiles).")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def build(input_path, outdir, zoom, num_tiles, threshold, log_level):
+def build(input_path, outdir, zoom, num_tiles, threshold, mbtiles, mbtiles_path, log_level):
     """Run the full pipeline: tile then generate MVTs."""
     _setup_logging(log_level)
     import starlet
@@ -121,10 +129,14 @@ def build(input_path, outdir, zoom, num_tiles, threshold, log_level):
         zoom=zoom,
         num_tiles=num_tiles,
         threshold=threshold,
+        mbtiles=mbtiles,
+        mbtiles_path=mbtiles_path,
     )
     click.echo(f"Build complete:")
     click.echo(f"  Tiles: {tile_result.num_files} files, {tile_result.total_rows} rows")
     click.echo(f"  MVTs: {mvt_result.tile_count} tiles across zoom levels {mvt_result.zoom_levels}")
+    if mvt_result.mbtiles_path:
+        click.echo(f"  MBTiles: {mvt_result.mbtiles_path}")
 
 
 @main.command()
